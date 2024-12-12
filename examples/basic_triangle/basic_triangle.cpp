@@ -31,17 +31,23 @@ using namespace donut;
 
 static const char* g_WindowTitle = "Donut Example: Basic Triangle";
 
+
+//inherit from IRenderPass interface to create a user defined render class
+//IRenderPass is the basic interface that updates, renders and allows exposes event handling 
+
 class BasicTriangle : public app::IRenderPass
 {
 private:
-    nvrhi::ShaderHandle m_VertexShader;
-    nvrhi::ShaderHandle m_PixelShader;
-    nvrhi::GraphicsPipelineHandle m_Pipeline;
+    nvrhi::ShaderHandle m_VertexShader; //access vertex shader bytecode
+    nvrhi::ShaderHandle m_PixelShader;  //access pixel shader bytecode
+    nvrhi::GraphicsPipelineHandle m_Pipeline;   //
+
     nvrhi::CommandListHandle m_CommandList;
 
 public:
     using IRenderPass::IRenderPass;
 
+    //common initialization setup for the user application
     bool Init()
     {
         std::filesystem::path appShaderPath = app::GetDirectoryWithExecutable() / "shaders/basic_triangle" /  app::GetShaderTypeName(GetDevice()->getGraphicsAPI());
@@ -94,6 +100,7 @@ public:
         state.framebuffer = framebuffer;
         state.viewport.addViewportAndScissorRect(framebuffer->getFramebufferInfo().getViewport());
 
+        //This sets up the whole pipeline: shaders, bindings, states
         m_CommandList->setGraphicsState(state);
 
         nvrhi::DrawArguments args;

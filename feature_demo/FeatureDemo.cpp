@@ -36,6 +36,8 @@
 #include <donut/engine/ShaderFactory.h>
 #include <donut/engine/TextureCache.h>
 #include <donut/render/BloomPass.h>
+#include <donut/render/ERAAResolvePass.h>
+#include <donut/render/ERAAPass.h>
 #include <donut/render/CascadedShadowMap.h>
 #include <donut/render/DeferredLightingPass.h>
 #include <donut/render/DepthPass.h>
@@ -115,7 +117,7 @@ public:
         desc.clearValue = nvrhi::Color(0.f);
         desc.isTypeless = false;
         desc.isUAV = sampleCount == 1;
-        desc.format = nvrhi::Format::RGBA16_FLOAT;
+        desc.format = nvrhi::Format::RGBA32_FLOAT;
         desc.initialState = nvrhi::ResourceStates::RenderTarget;
         desc.debugName = "HdrColor";
         HdrColor = device->createTexture(desc);
@@ -129,7 +131,7 @@ public:
         desc.sampleCount = 1;
         desc.dimension = nvrhi::TextureDimension::Texture2D;
 
-        desc.format = nvrhi::Format::RGBA16_FLOAT;
+        desc.format = nvrhi::Format::RGBA32_FLOAT;
         desc.isUAV = true;
         desc.mipLevels = uint32_t(floorf(::log2f(float(std::max(desc.width, desc.height)))) + 1.f); // Used to test the MipMapGen pass
         desc.debugName = "ResolvedColor";
@@ -229,6 +231,7 @@ enum class AntiAliasingMode
 {
     NONE,
     TEMPORAL,
+    ERAA,
     MSAA_2X,
     MSAA_4X,
     MSAA_8X
@@ -244,20 +247,21 @@ struct UIData
     SsaoParameters                      SsaoParams;
     ToneMappingParameters               ToneMappingParams;
     TemporalAntiAliasingParameters      TemporalAntiAliasingParams;
+    ERAAParameters                      ERAAParams;
     SkyParameters                       SkyParams;
-    enum AntiAliasingMode               AntiAliasingMode = AntiAliasingMode::TEMPORAL;
+    enum AntiAliasingMode               AntiAliasingMode = AntiAliasingMode::ERAA;
     enum TemporalAntiAliasingJitter     TemporalAntiAliasingJitter = TemporalAntiAliasingJitter::MSAA;
     bool                                EnableVsync = true;
     bool                                ShaderReoladRequested = false;
-    bool                                EnableProceduralSky = true;
-    bool                                EnableBloom = true;
+    bool                                EnableProceduralSky = false;
+    bool                                EnableBloom = false;
     float                               BloomSigma = 32.f;
     float                               BloomAlpha = 0.05f;
-    bool                                EnableTranslucency = true;
+    bool                                EnableTranslucency = false;
     bool                                EnableMaterialEvents = false;
-    bool                                EnableShadows = true;
+    bool                                EnableShadows = false;
     float                               AmbientIntensity = 1.0f;
-    bool                                EnableLightProbe = true;
+    bool                                EnableLightProbe = false;
     float                               LightProbeDiffuseScale = 1.f;
     float                               LightProbeSpecularScale = 1.f;
     float                               CsmExponent = 4.f;
@@ -296,6 +300,10 @@ private:
     std::unique_ptr<SkyPass>            m_SkyPass;
     std::unique_ptr<TemporalAntiAliasingPass> m_TemporalAntiAliasingPass;
     std::unique_ptr<BloomPass>          m_BloomPass;
+	std::unique_ptr<ERAAResolvePass>    m_ERAAResolvePass;
+	std::unique_ptr<ERAAPass>           m_ERAAPass;
+
+
     std::unique_ptr<ToneMappingPass>    m_ToneMappingPass;
     std::unique_ptr<SsaoPass>           m_SsaoPass;
     std::shared_ptr<LightProbeProcessingPass> m_LightProbePass;
@@ -355,7 +363,11 @@ public:
         m_TextureCache = std::make_shared<TextureCache>(GetDevice(), m_NativeFs, nullptr);
 
         m_ShaderFactory = std::make_shared<ShaderFactory>(GetDevice(), m_RootFs, "/shaders");
-        m_CommonPasses = std::make_shared<CommonRenderPasses>(GetDevice(), m_ShaderFactory);
+
+        int w = deviceManager->GetCurrentFramebuffer()->getFramebufferInfo().width;
+		int h = deviceManager->GetCurrentFramebuffer()->getFramebufferInfo().height;
+
+        m_CommonPasses = std::make_shared<CommonRenderPasses>(GetDevice(), m_ShaderFactory,w,h);
 
         m_OpaqueDrawStrategy = std::make_shared<InstancedOpaqueDrawStrategy>();
         m_TransparentDrawStrategy = std::make_shared<TransparentDrawStrategy>();
@@ -394,7 +406,7 @@ public:
         SetAsynchronousLoadingEnabled(true);
 
         if (sceneName.empty())
-            SetCurrentSceneName(app::FindPreferredScene(m_SceneFilesAvailable, "Sponza.gltf"));
+            SetCurrentSceneName(app::FindPreferredScene(m_SceneFilesAvailable, "plane.gltf"));
         else
             SetCurrentSceneName(sceneName);
 
@@ -806,6 +818,21 @@ public:
             m_TemporalAntiAliasingPass = std::make_unique<TemporalAntiAliasingPass>(GetDevice(), m_ShaderFactory, m_CommonPasses, *m_View, taaParams);
         }
 
+		{
+			ERAAPass::CreateParameters taaParams;
+			taaParams.sourceDepth = m_RenderTargets->Depth;
+			taaParams.motionVectors = m_RenderTargets->MotionVectors;
+			taaParams.unresolvedColor = m_RenderTargets->HdrColor;
+			taaParams.resolvedColor = m_RenderTargets->ResolvedColor;
+			taaParams.feedback1 = m_RenderTargets->TemporalFeedback1;
+			taaParams.feedback2 = m_RenderTargets->TemporalFeedback2;
+			taaParams.motionVectorStencilMask = motionVectorStencilMask;
+			taaParams.useCatmullRomFilter = true;
+
+			m_ERAAPass = std::make_unique<ERAAPass>(GetDevice(), m_ShaderFactory, m_CommonPasses, *m_View, taaParams);
+		}
+
+
         if (m_RenderTargets->GetSampleCount() == 1)
         {
             m_SsaoPass = std::make_unique<SsaoPass>(GetDevice(), m_ShaderFactory, m_CommonPasses, m_RenderTargets->Depth, m_RenderTargets->GBufferNormals, m_RenderTargets->AmbientOcclusion);
@@ -824,6 +851,8 @@ public:
         m_ToneMappingPass = std::make_unique<ToneMappingPass>(GetDevice(), m_ShaderFactory, m_CommonPasses, m_RenderTargets->LdrFramebuffer, *m_View, toneMappingParams);
 
         m_BloomPass = std::make_unique<BloomPass>(GetDevice(), m_ShaderFactory, m_CommonPasses, m_RenderTargets->ResolvedFramebuffer, *m_View);
+	    m_ERAAResolvePass = std::make_unique<ERAAResolvePass>(GetDevice(), m_ShaderFactory, m_CommonPasses, m_RenderTargets->ResolvedFramebuffer, *m_View);
+
 
         m_PreviousViewsValid = false;
     }
@@ -899,7 +928,8 @@ public:
 
         nvrhi::ITexture* framebufferTexture = framebuffer->getDesc().colorAttachments[0].texture;
         m_CommandList->clearTextureFloat(framebufferTexture, nvrhi::AllSubresources, nvrhi::Color(0.f));
-        
+        m_CommandList->clearTextureFloat(m_CommonPasses->m_ERAAMetaDataTexture2D, nvrhi::AllSubresources, nvrhi::Color(0.0f));
+
         m_AmbientTop = m_ui.AmbientIntensity * m_ui.SkyParams.skyColor * m_ui.SkyParams.brightness;
         m_AmbientBottom = m_ui.AmbientIntensity * m_ui.SkyParams.groundColor * m_ui.SkyParams.brightness;
         if (m_ui.EnableShadows)
@@ -1059,7 +1089,7 @@ public:
             {
                 m_TemporalAntiAliasingPass->RenderMotionVectors(m_CommandList, *m_View, *m_ViewPrevious);
             }
-
+               
             m_TemporalAntiAliasingPass->TemporalResolve(m_CommandList, m_ui.TemporalAntiAliasingParams, m_PreviousViewsValid, *m_View, *m_View);
 
             finalHdrColor = m_RenderTargets->ResolvedColor;
@@ -1068,7 +1098,22 @@ public:
             {
                 m_BloomPass->Render(m_CommandList, m_RenderTargets->ResolvedFramebuffer, *m_View, m_RenderTargets->ResolvedColor, m_ui.BloomSigma, m_ui.BloomAlpha);
             }
+
             m_PreviousViewsValid = true;
+        }
+        else if (m_ui.AntiAliasingMode == AntiAliasingMode::ERAA)
+        {
+			
+			m_ERAAPass ->TemporalResolve(m_CommandList, m_ui.ERAAParams, m_PreviousViewsValid, *m_View, *m_View);
+
+			finalHdrColor = m_RenderTargets->ResolvedColor;
+
+			if (m_ui.EnableBloom)
+			{
+				m_BloomPass->Render(m_CommandList, m_RenderTargets->ResolvedFramebuffer, *m_View, m_RenderTargets->ResolvedColor, m_ui.BloomSigma, m_ui.BloomAlpha);
+			}
+
+			m_PreviousViewsValid = true;
         }
         else
         {
@@ -1096,9 +1141,9 @@ public:
             toneMappingParams.eyeAdaptationSpeedUp = 0.f;
             toneMappingParams.eyeAdaptationSpeedDown = 0.f;
         }
-        m_ToneMappingPass->SimpleRender(m_CommandList, toneMappingParams, *m_View, finalHdrColor);
-        
-        m_CommonPasses->BlitTexture(m_CommandList, framebuffer, m_RenderTargets->LdrColor, &m_BindingCache);
+
+        //m_ToneMappingPass->SimpleRender(m_CommandList, toneMappingParams, *m_View, finalHdrColor);
+        m_CommonPasses->BlitTexture(m_CommandList, framebuffer, finalHdrColor, &m_BindingCache);
 
         if (m_ui.TestMipMapGen)
         {
@@ -1172,6 +1217,7 @@ public:
         }
 
         m_TemporalAntiAliasingPass->AdvanceFrame();
+        m_ERAAPass->AdvanceFrame();
         std::swap(m_View, m_ViewPrevious);
 
         GetDeviceManager()->SetVsyncEnabled(m_ui.EnableVsync);
@@ -1505,7 +1551,7 @@ protected:
             ImGui::EndCombo();
         }
         
-        ImGui::Combo("AA Mode", (int*)&m_ui.AntiAliasingMode, "None\0TemporalAA\0MSAA 2x\0MSAA 4x\0MSAA 8x\0");
+        ImGui::Combo("AA Mode", (int*)&m_ui.AntiAliasingMode, "None\0TemporalAA\0ERAA\0MSAA 2x\0MSAA 4x\0MSAA 8x\0");
         ImGui::Combo("TAA Camera Jitter", (int*)&m_ui.TemporalAntiAliasingJitter, "MSAA\0Halton\0R2\0White Noise\0");
         
         ImGui::SliderFloat("Ambient Intensity", &m_ui.AmbientIntensity, 0.f, 1.f);
@@ -1526,6 +1572,7 @@ protected:
             ImGui::SliderFloat("Glow Intensity", &m_ui.SkyParams.glowIntensity, 0.f, 1.f);
             ImGui::SliderFloat("Horizon Size", &m_ui.SkyParams.horizonSize, 0.f, 90.f);
         }
+
         ImGui::Checkbox("Enable SSAO", &m_ui.EnableSsao);
         ImGui::Checkbox("Enable Bloom", &m_ui.EnableBloom);
         ImGui::DragFloat("Bloom Sigma", &m_ui.BloomSigma, 0.01f, 0.1f, 100.f);
